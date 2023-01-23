@@ -1,1 +1,2 @@
 # CertificateCheck
+# The CloudFormation template is designed to created the supporting Certificate resources to check that a Certificate exists with the Certificate Lambda Function. The code is in the form of zip file which is added to the lambda function. The lambda function is searching for a certificate ARN. Once the function is executed it references the function to get the Private Certificates ARN.
