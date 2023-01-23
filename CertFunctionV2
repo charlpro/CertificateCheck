@@ -1,0 +1,150 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Parameters:
+  RuleId:
+    AllowedPattern: "^[a-z0-9-]{1,256}$"
+    ConstraintDescription: Must be 1 to 256 lowercase letters, numbers, or hyphens. Example 'iam-password-policy'
+    Default: rule-id
+    Description: ID of the config rule. Example 'iam-password-policy'
+    Type: String
+
+
+Resources:
+  RootCA:
+    Type: AWS::ACMPCA::CertificateAuthority
+    Properties:
+      Type: ROOT
+      KeyAlgorithm: RSA_2048
+      SigningAlgorithm: SHA256WITHRSA
+      KeyStorageSecurityStandard: FIPS_140_2_LEVEL_2_OR_HIGHER
+      Subject:
+        Organization: privateca
+
+  RootCACertificate:
+    Type: AWS::ACMPCA::Certificate
+    Properties:
+      CertificateAuthorityArn:
+        !Ref RootCA
+      CertificateSigningRequest:
+        Fn::GetAtt:
+          - RootCA
+          - CertificateSigningRequest
+      SigningAlgorithm: SHA256WITHRSA
+      TemplateArn: !Sub arn:${AWS::Partition}:acm-pca:::template/RootCACertificate/V1
+      Validity:
+        Type: YEARS
+        Value: 2
+
+  RootCAActivation:
+    Type: AWS::ACMPCA::CertificateAuthorityActivation
+    Properties:
+      CertificateAuthorityArn:
+        !Ref RootCA
+      Certificate:
+        Fn::GetAtt:
+          - RootCACertificate
+          - Certificate
+      Status: ACTIVE
+
+  RootCAPermission:
+    Type: AWS::ACMPCA::Permission
+    Properties:
+      Actions:
+        - IssueCertificate
+        - GetCertificate
+        - ListPermissions
+      CertificateAuthorityArn: !Ref RootCA
+      Principal: acm.amazonaws.com
+
+  CertificateFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt CustomResourceRole.Arn
+      Runtime: python3.8
+      Timeout: 900
+      Code:
+        ZipFile: |
+          from time import sleep
+
+          import boto3
+          import cfnresponse
+          from botocore.exceptions import ClientError
+
+
+          def handler(event, context):
+              reason = None
+              status = cfnresponse.SUCCESS
+              sleep_period = 30
+              retry = 1
+              max_tries = 25
+              response = None
+              try:
+                  cert_arn = event["ResourceProperties"]["certificateArn"].split("|")
+                  client = boto3.client("acm-pca")
+
+                  if event["RequestType"] in ["Create", "Update"]:
+                      while retry <= max_tries:
+                          try:
+                              sleep(sleep_period)
+                              response = client.get_certificate(CertificateAuthorityArn=cert_arn[1], CertificateArn=cert_arn[0])
+                          except ClientError as error:
+                              if error.response["Error"]["Code"] == "RequestInProgressException":
+                                  retry +=1
+                              else:
+                                  reason = str(error)
+                                  status = cfnresponse.FAILED
+                                  break
+                          if response:
+                              break
+              except Exception as e:
+                  reason = str(e)
+                  status = cfnresponse.FAILED
+              if retry == max_tries:
+                  reason = f"Reached Max Tries {max_tries} - Failed"
+                  status = cfnresponse.FAILED
+              cfnresponse.send(event, context, status, {}, str(bool(response)), False, reason)
+
+  CheckCertificateExists:
+    Type: "Custom::CheckCertificateExists"
+    Properties:
+      ServiceToken: !GetAtt CertificateFunction.Arn
+      certificateAuthorityArn: !Ref RootCA
+      certificateArn: !Ref RootCACertificate
+
+  CustomResourceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Policies:
+        - PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - acm-pca:GetCertificate
+                Resource: "*"
+          PolicyName: getcert
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+
+  PrivateCertificate:
+    DependsOn:
+      - RootCAActivation
+      - RootCAPermission
+      - CheckCertificateExists
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      CertificateTransparencyLoggingPreference: ENABLED
+      CertificateAuthorityArn: !Ref RootCA
+      DomainName: !Sub cert.${RuleId}.com
+
+ 
